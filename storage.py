@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS readings (
     segment_scores TEXT NOT NULL,
     model_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS baselines (
+    machine_id INTEGER PRIMARY KEY REFERENCES machines(id) ON DELETE CASCADE,
+    created TEXT NOT NULL,
+    health REAL NOT NULL,
+    profile TEXT NOT NULL,
+    clips INTEGER NOT NULL,
+    model_id TEXT NOT NULL
+);
 """
 
 
@@ -199,3 +207,27 @@ def fleet(owner_id):
             "Last health": round(float(last["health"])) if last is not None else None,
         })
     return pd.DataFrame(rows)
+
+def set_baseline(owner_id, machine_id, health, profile, clips, model_id):
+    if not owns(owner_id, machine_id):
+        raise PermissionError("Machine does not belong to this account")
+    with session() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO baselines (machine_id, created, health, profile, clips, model_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (machine_id, now(), float(health), json.dumps([float(v) for v in profile]), clips, model_id),
+        )
+
+
+def get_baseline(owner_id, machine_id, model_id):
+    with session() as conn:
+        row = conn.execute(
+            "SELECT b.* FROM baselines b JOIN machines m ON m.id = b.machine_id "
+            "WHERE m.owner_id = ? AND b.machine_id = ? AND b.model_id = ?",
+            (owner_id, machine_id, model_id),
+        ).fetchone()
+    if row is None:
+        return None
+    base = dict(row)
+    base["profile"] = json.loads(base["profile"])
+    return base

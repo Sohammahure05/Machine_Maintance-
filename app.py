@@ -7,6 +7,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
 
+import re
+import numpy as np
+import degradation
+from config import CHANNELS, MODEL_PATH, SAVE_UPLOADS, SR, SUBF_SR
+
 import analytics
 import auth
 import storage
@@ -166,29 +171,43 @@ def analysis_section(user, machine, bundle):
     st.pyplot(fig)
     plt.close(fig)
 
-    st.markdown("**Comparison with this machine's history**")
-    if comparison is None:
-        st.info("No saved readings with the current model yet. Save this one to start a baseline.")
+    st.markdown("**Comparison with this machine's ideal and history**")
+    base = storage.get_baseline(user["id"], int(machine["id"]), model_id)
+    if base is None:
+        st.info("No ideal sound stored for this machine. Record healthy clips in the batch section "
+                "(choose 'Healthy reference') to measure degradation.")
     else:
+        pct = degradation.degradation_pct(base["health"], result["health"])
+        shift = degradation.spectral_shift_pct(base["profile"], result["profile"])
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Degradation", f"{pct:.0f}%")
+        m1.caption(degradation.grade(pct))
+        m2.metric("Ideal health", f"{base['health']:.0f}")
+        m2.caption(f"{base['clips']} reference clip(s)")
+        m3.metric("Spectral shift", f"{shift:.0f}%" if shift is not None else "n/a")
         left, right = st.columns(2)
         fig, ax = plt.subplots(figsize=(8, 3.4))
-        plot_trend(ax, prev, result)
+        degradation.plot_degradation(ax, prev["health"], result["health"], base["health"])
         fig.tight_layout()
         left.pyplot(fig)
         plt.close(fig)
-        fig, ax = plt.subplots(figsize=(8, 3.4))
-        plot_profile(ax, result, comparison)
-        fig.tight_layout()
-        right.pyplot(fig)
-        plt.close(fig)
+        if comparison is not None:
+            fig, ax = plt.subplots(figsize=(8, 3.4))
+            plot_profile(ax, result, comparison)
+            fig.tight_layout()
+            right.pyplot(fig)
+            plt.close(fig)
+        times = (prev["recorded_at"] - prev["recorded_at"].iloc[0]).dt.total_seconds() / 86400 if len(prev) else []
+        eta = degradation.days_to_boundary(times, list(prev["health"])) if len(prev) else None
+        if eta is not None:
+            st.caption(f"Rough straight-line estimate: about {eta:.0f} day(s) until the abnormal boundary.")
+    if comparison is not None:
         st.write(
             f"Against {comparison['readings_used']} earlier reading(s): health index "
             f"{comparison['health_change']:+.0f} points from the baseline of {comparison['baseline_health']:.0f}. "
             f"Trend: {trend_info['direction'].lower()}. Largest spectral changes: "
             + "; ".join(analytics.describe_changes(comparison)) + "."
         )
-
-    with st.expander("Segment scores and input checks"):
         st.dataframe(pd.DataFrame({
             "Segment start (s)": result["segment_times"],
             "Abnormal probability": result["segment_scores"].round(3),
@@ -257,6 +276,122 @@ def history_section(user, machine, bundle):
             flash(f"Reading {target} deleted.")
             st.rerun()
 
+MAX_BATCH = 10
+
+
+def guess_machine(name, machines):
+    for m in machines.itertuples():
+        if re.match(rf"{re.escape(str(m.code))}[_\-\s.]", name):
+            return int(m.id)
+    return int(machines["id"].iloc[0])
+
+
+def batch_section(user, bundle):
+    machines = storage.list_machines(user["id"])
+    if machines.empty:
+        return
+    model_id = bundle["info"]["trained_at"]
+    st.subheader("Batch upload (up to 10 recordings)")
+    st.caption("Name files like 01_fan.wav so each one is matched to machine 01 automatically.")
+    uploads = st.file_uploader("Recordings", type=["wav", "flac", "ogg", "mp3", "csv"],
+                               accept_multiple_files=True, key="batch_upload")
+    if not uploads:
+        return
+    if len(uploads) > MAX_BATCH:
+        st.warning(f"Only the first {MAX_BATCH} files are used.")
+        uploads = uploads[:MAX_BATCH]
+    labels = {int(m.id): f"{m.code}: {m.name} ({m.type})" for m in machines.itertuples()}
+    ids = list(labels)
+    picks = {}
+    for up in uploads:
+        default = ids.index(guess_machine(up.name, machines))
+        picks[up.name] = st.selectbox(up.name, ids, index=default, format_func=labels.get,
+                                      key=f"batch_pick_{up.name}")
+    mode = st.radio("What are these recordings?",
+                    ["Current condition check", "Healthy reference (set machine's ideal sound)"])
+    if st.button("Analyse all"):
+        rows = []
+        for up in uploads:
+            mid = picks[up.name]
+            machine = machines[machines["id"] == mid].iloc[0]
+            try:
+                signals = read_upload(up, SUBF_SR)
+                result = analyse(signals, bundle["machines"][machine["type"]])
+            except Exception as error:
+                st.error(f"{up.name}: {error}")
+                continue
+            rows.append({"mid": mid, "name": up.name, "data": up.getvalue(), "result": result})
+        st.session_state["batch"] = {"rows": rows, "mode": mode, "saved": False}
+    batch = st.session_state.get("batch")
+    if not batch or not batch["rows"]:
+        return
+    if batch["mode"].startswith("Healthy"):
+        batch_baseline_view(user, machines, batch, model_id)
+    else:
+        batch_condition_view(user, machines, batch, model_id)
+
+
+def batch_condition_view(user, machines, batch, model_id):
+    table = []
+    for item in batch["rows"]:
+        machine = machines[machines["id"] == item["mid"]].iloc[0]
+        result = item["result"]
+        base = storage.get_baseline(user["id"], item["mid"], model_id)
+        pct = degradation.degradation_pct(base["health"], result["health"]) if base else None
+        shift = degradation.spectral_shift_pct(base["profile"], result["profile"]) if base else None
+        table.append({
+            "Machine": machine["code"], "File": item["name"],
+            "Status": result["status"], "Level": result["level"],
+            "Health": round(result["health"]),
+            "Ideal health": round(base["health"]) if base else None,
+            "Degradation %": round(pct) if pct is not None else None,
+            "Wear grade": degradation.grade(pct) if pct is not None else "No baseline",
+            "Spectral shift %": round(shift) if shift is not None else None,
+        })
+    frame = pd.DataFrame(table)
+    st.dataframe(frame, hide_index=True)
+    if frame["Degradation %"].notna().any():
+        worst = frame.loc[frame["Degradation %"].idxmax()]
+        st.warning(f"Most degraded: machine {worst['Machine']} at {worst['Degradation %']:.0f}% "
+                   f"({worst['Wear grade']}).")
+    if frame["Wear grade"].eq("No baseline").any():
+        st.info("Machines marked 'No baseline' need healthy reference recordings first. "
+                "Choose 'Healthy reference' above and analyse again.")
+    st.download_button("Download batch summary (CSV)", frame.to_csv(index=False),
+                       file_name="batch_summary.csv", mime="text/csv")
+    if batch["saved"]:
+        st.info("These readings are saved to history.")
+    elif st.button("Save all readings to history"):
+        for item in batch["rows"]:
+            path = storage.save_upload(user["id"], item["mid"], item["name"], item["data"]) if SAVE_UPLOADS else None
+            storage.add_reading(user["id"], item["mid"], item["name"], path, item["result"], model_id)
+        batch["saved"] = True
+        flash(f"{len(batch['rows'])} readings saved.")
+        st.rerun()
+
+
+def batch_baseline_view(user, machines, batch, model_id):
+    groups = {}
+    for item in batch["rows"]:
+        groups.setdefault(item["mid"], []).append(item["result"])
+    for mid, results in groups.items():
+        code = machines[machines["id"] == mid]["code"].iloc[0]
+        flagged = [r for r in results if r["status"] != "Normal"]
+        line = f"Machine {code}: {len(results)} clip(s), mean health {np.mean([r['health'] for r in results]):.0f}"
+        if flagged:
+            st.error(line + f". {len(flagged)} clip(s) were flagged abnormal, so this machine may not be healthy. "
+                     "Do not use them as its ideal.")
+        elif len(results) < 3:
+            st.warning(line + ". Use at least 3 clips for a stable baseline.")
+        else:
+            st.success(line)
+    if st.button("Save as each machine's ideal sound"):
+        for mid, results in groups.items():
+            profile = np.mean([np.asarray(r["profile"], float) for r in results], axis=0)
+            storage.set_baseline(user["id"], mid, float(np.mean([r["health"] for r in results])),
+                                 profile, len(results), model_id)
+        flash("Baselines saved.")
+        st.rerun()
 
 def main():
     user = st.session_state.get("user")
@@ -285,6 +420,7 @@ def main():
         return
     remove_machine(user, machine)
     analysis_section(user, machine, bundle)
+    batch_section(user, bundle)
     history_section(user, machine, bundle)
 
 

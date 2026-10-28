@@ -62,7 +62,7 @@ def update(files, source):
     if todo.empty:
         return
     print(f"Extracting features for {len(todo)} new {source} files")
-    results = Parallel(n_jobs=-1, verbose=5)(
+    results = Parallel(n_jobs=4, verbose=5)(
         delayed(extract)(r.path, source, variants_for(source, r.snr), SEED + i)
         for i, r in enumerate(todo.itertuples())
     )

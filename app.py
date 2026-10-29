@@ -137,8 +137,11 @@ def analysis_section(user, machine, bundle):
     signal = signals[0]
 
     prev = storage.readings(user["id"], int(machine["id"]), model_id)
+    ideal_now = storage.get_baseline(user["id"], int(machine["id"]), model_id)
+    if ideal_now is not None:
+        prev = prev[prev["recorded_at"] >= pd.Timestamp(ideal_now["created"])].reset_index(drop=True)
     trend_info = analytics.trend(list(prev["health"]) + [result["health"]])
-    comparison = analytics.compare(result, prev)
+    comparison = analytics.compare(result, prev, ideal_now["profile"] if ideal_now is not None else None)
     alert_list = analytics.alerts(prev, trend_info, comparison)
 
     banner = f"{result['status']}: {result['level']}"
@@ -173,27 +176,35 @@ def analysis_section(user, machine, bundle):
 
     st.markdown("**Comparison with this machine's ideal and history**")
     base = storage.get_baseline(user["id"], int(machine["id"]), model_id)
+    since_ideal = prev[prev["recorded_at"] >= pd.Timestamp(base["created"])] if base is not None else prev
     if base is None:
         st.info("No ideal sound stored for this machine. Record healthy clips in the batch section "
                 "(choose 'Healthy reference') to measure degradation.")
     else:
         pct = degradation.degradation_pct(base["health"], result["health"])
         shift = degradation.spectral_shift_pct(base["profile"], result["profile"])
-        m1, m2, m3 = st.columns(3)
+        r2 = degradation.r2_value(base["profile"], result["profile"])
+        r2_pct = degradation.r2_degradation_pct(base["profile"], result["profile"])
+
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Degradation", f"{pct:.0f}%")
         m1.caption(degradation.grade(pct))
         m2.metric("Ideal health", f"{base['health']:.0f}")
         m2.caption(f"{base['clips']} reference clip(s)")
         m3.metric("Spectral shift", f"{shift:.0f}%" if shift is not None else "n/a")
+        m4.metric("R²", f"{r2:.3f}" if r2 is not None else "n/a")
+        m4.caption(f"R² degradation {r2_pct:.0f}%: {degradation.r2_condition(r2)}" if r2_pct is not None else "")
+
         left, right = st.columns(2)
         fig, ax = plt.subplots(figsize=(8, 3.4))
-        degradation.plot_degradation(ax, prev["health"], result["health"], base["health"])
+        prev_pct = degradation.r2_series(base["profile"], since_ideal["profile"]) if len(since_ideal) else []
+        degradation.plot_r2_trend(ax, prev_pct, r2_pct if r2_pct is not None else 0.0)
         fig.tight_layout()
         left.pyplot(fig)
         plt.close(fig)
         if comparison is not None:
             fig, ax = plt.subplots(figsize=(8, 3.4))
-            plot_profile(ax, result, comparison)
+            plot_profile(ax, result, {"baseline_profile": base["profile"]})
             fig.tight_layout()
             right.pyplot(fig)
             plt.close(fig)
@@ -203,7 +214,7 @@ def analysis_section(user, machine, bundle):
             st.caption(f"Rough straight-line estimate: about {eta:.0f} day(s) until the abnormal boundary.")
     if comparison is not None:
         st.write(
-            f"Against {comparison['readings_used']} earlier reading(s): health index "
+            f"Against {comparison['readings_used']} earlier normal reading(s): health index "
             f"{comparison['health_change']:+.0f} points from the baseline of {comparison['baseline_health']:.0f}. "
             f"Trend: {trend_info['direction'].lower()}. Largest spectral changes: "
             + "; ".join(analytics.describe_changes(comparison)) + "."
@@ -224,15 +235,46 @@ def analysis_section(user, machine, bundle):
         saved.add(key)
         flash("Reading saved to history.")
         st.rerun()
+        
+    base_ideal = storage.get_baseline(user["id"], int(machine["id"]), model_id)
+    if base_ideal is None:
+        st.info("No ideal set yet for this machine.")
+    else:
+        st.info(
+            f"Ideal: health {base_ideal['health']:.0f} "
+            f"on {base_ideal['created']} ({base_ideal['clips']} reference clip(s))"
+        )
+    if result["status"] == "Normal":
+        if st.button("Set this recording as ideal"):
+            storage.set_baseline(user["id"], int(machine["id"]), result["health"], result["profile"], 1, model_id)
+            flash(f"Ideal set for machine {machine['code']}.")
+            st.rerun()
+    else:
+        st.caption("Ideal should be a healthy recording — this one is Abnormal, so it cannot be set as ideal.")
+
 
     meta = {"code": machine["code"], "name": machine["name"], "type": machine["type"],
             "location": machine["location"], "file": upload.name,
             "time": datetime.now().strftime("%Y-%m-%d %H:%M")}
     history = {"prev": prev, "comparison": comparison, "trend": trend_info, "alerts": alert_list}
-    pdf = build_pdf(result, signal, meta, load_reference(machine["type"]), history)
+    ideal_info = None
+    if base is not None:
+        r2_now = degradation.r2_value(base["profile"], result["profile"])
+        ideal_info = {
+            "health": base["health"],
+            "clips": base["clips"],
+            "created": base["created"],
+            "r2": r2_now,
+            "r2_pct": degradation.r2_degradation_pct(base["profile"], result["profile"]),
+            "shift": degradation.spectral_shift_pct(base["profile"], result["profile"]),
+            "prev_pct": degradation.r2_series(base["profile"], since_ideal["profile"]) if len(since_ideal) else [],
+            "condition": degradation.r2_condition(r2_now),
+        }
+    pdf = build_pdf(result, signal, meta, load_reference(machine["type"]), history, ideal_info)
     st.download_button("Download report (PDF)", pdf,
-                       file_name=f"report_{machine['code']}_{upload.name.rsplit('.', 1)[0]}.pdf",
+                    file_name=f"report_{machine['code']}_{upload.name.rsplit('.', 1)[0]}.pdf",
                        mime="application/pdf")
+    
 
 
 def history_section(user, machine, bundle):
@@ -339,22 +381,25 @@ def batch_condition_view(user, machines, batch, model_id):
         base = storage.get_baseline(user["id"], item["mid"], model_id)
         pct = degradation.degradation_pct(base["health"], result["health"]) if base else None
         shift = degradation.spectral_shift_pct(base["profile"], result["profile"]) if base else None
+        r2 = degradation.r2_value(base["profile"], result["profile"]) if base else None
+        r2_pct = degradation.r2_degradation_pct(base["profile"], result["profile"]) if base else None
         table.append({
             "Machine": machine["code"], "File": item["name"],
             "Status": result["status"], "Level": result["level"],
             "Health": round(result["health"]),
             "Ideal health": round(base["health"]) if base else None,
-            "Degradation %": round(pct) if pct is not None else None,
-            "Wear grade": degradation.grade(pct) if pct is not None else "No baseline",
             "Spectral shift %": round(shift) if shift is not None else None,
+            "R²": round(r2, 3) if r2 is not None else None,
+            "R² degradation %": round(r2_pct) if r2_pct is not None else None,
+            "Condition": degradation.r2_condition(r2),
         })
     frame = pd.DataFrame(table)
     st.dataframe(frame, hide_index=True)
-    if frame["Degradation %"].notna().any():
-        worst = frame.loc[frame["Degradation %"].idxmax()]
-        st.warning(f"Most degraded: machine {worst['Machine']} at {worst['Degradation %']:.0f}% "
-                   f"({worst['Wear grade']}).")
-    if frame["Wear grade"].eq("No baseline").any():
+    if frame["R² degradation %"].notna().any():
+        worst = frame.loc[frame["R² degradation %"].idxmax()]
+        st.warning(f"Most degraded: machine {worst['Machine']} at {worst['R² degradation %']:.0f}% "
+                   f"({worst['Condition']}).")
+    if frame["Condition"].eq("No baseline").any():
         st.info("Machines marked 'No baseline' need healthy reference recordings first. "
                 "Choose 'Healthy reference' above and analyse again.")
     st.download_button("Download batch summary (CSV)", frame.to_csv(index=False),

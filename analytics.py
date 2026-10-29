@@ -9,20 +9,25 @@ CENTERS = EDGES[1:-1]
 
 def trend(health):
     values = np.asarray(health[-TREND_WINDOW:], dtype=float)
-    if len(values) < 3:
-        return {"direction": "Not enough data", "slope": 0.0, "change": 0.0, "points": int(len(values))}
-    slope = float(np.polyfit(np.arange(len(values)), values, 1)[0])
+    n = len(values)
+    if n < 3:
+        return {"direction": "Not enough data", "slope": 0.0, "change": 0.0, "points": int(n)}
+    slopes = [(values[j] - values[i]) / (j - i) for i in range(n) for j in range(i + 1, n)]
+    slope = float(np.median(slopes))
+    change = slope * (n - 1)
     direction = "Declining" if slope <= -TREND_SLOPE else "Improving" if slope >= TREND_SLOPE else "Stable"
-    return {"direction": direction, "slope": slope, "change": float(values[-1] - values[0]),
-            "points": int(len(values))}
+    return {"direction": direction, "slope": slope, "change": float(change), "points": int(n)}
 
 
-def compare(result, prev):
+def compare(result, prev, ideal_profile=None):
     if prev.empty:
         return None
     normal = prev[prev["status"] == "Normal"]
     base = normal if len(normal) >= 2 else prev
-    baseline = np.median(np.stack(base["profile"].to_list()), axis=0)
+    if ideal_profile is not None:
+        baseline = np.asarray(ideal_profile, dtype=float)
+    else:
+        baseline = np.median(np.stack(base["profile"].to_list()), axis=0)
     delta = np.asarray(result["profile"]) - baseline
     changes = []
     for band in np.array_split(np.arange(N_MELS), 8):

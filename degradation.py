@@ -1,4 +1,5 @@
 import numpy as np
+from sklearn.metrics import r2_score
 
 BOUNDARY = 50.0
 MIN_SPAN = 10.0
@@ -19,6 +20,21 @@ def spectral_shift_pct(base_profile, profile):
     if base.shape != now.shape:
         return None
     return float(np.linalg.norm(now - base) / (np.linalg.norm(base) + 1e-9) * 100)
+
+def r2_value(base_profile, profile):
+    base = np.asarray(base_profile, float)
+    now = np.asarray(profile, float)
+    if base.shape != now.shape:
+        return None
+    return float(r2_score(base, now))
+
+
+def r2_degradation_pct(base_profile, profile):
+    value = r2_value(base_profile, profile)
+    if value is None:
+        return None
+    return float(np.clip((1 - value) * 100, 0, 100))
+
 
 
 def days_to_boundary(times, health, min_points=5, min_days=2.0):
@@ -51,3 +67,45 @@ def plot_degradation(ax, prev_health, new_health, base_health):
     ax.set_xticks(range(1, x_new + 1))
     ax.legend(fontsize=8, loc="lower left")
     return pct
+
+R2_HEALTHY = 0.92
+R2_WATCH = 0.88
+
+
+def r2_condition(value):
+    if value is None:
+        return "No baseline"
+    if value >= R2_HEALTHY:
+        return "Healthy"
+    if value >= R2_WATCH:
+        return "Watch"
+    return "Degraded"
+
+def pct_condition(pct):
+    return r2_condition(1 - pct / 100)
+
+
+def r2_series(base_profile, profiles):
+    values = []
+    for profile in profiles:
+        value = r2_degradation_pct(base_profile, profile)
+        values.append(0.0 if value is None else value)
+    return values
+
+
+def plot_r2_trend(ax, prev_pct, new_pct):
+    past = list(prev_pct)
+    x_new = len(past) + 1
+    if past:
+        ax.plot(range(1, len(past) + 1), past, marker="o", color="#1565c0", label="saved readings")
+        ax.plot([len(past), x_new], [past[-1], new_pct], color="#1565c0", linestyle=":")
+    ax.scatter([x_new], [new_pct], marker="*", s=180, color="#c62828", zorder=5, label="this reading")
+    ax.axhline(100 * (1 - R2_HEALTHY), color="orange", linestyle="--", label="watch limit")
+    ax.axhline(100 * (1 - R2_WATCH), color="red", linestyle="--", label="degraded limit")
+    ax.set_title(f"Degradation vs ideal (R2): {new_pct:.0f}% ({pct_condition(new_pct)})")
+    ax.set_xlabel("Reading number since the ideal was set")
+    ax.set_ylabel("Degradation %")
+    ax.set_xlim(0.5, x_new + 0.5)
+    ax.set_ylim(0, 100)
+    ax.set_xticks(range(1, x_new + 1))
+    ax.legend(fontsize=8, loc="upper left")

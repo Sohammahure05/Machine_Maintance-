@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS baselines (
     clips INTEGER NOT NULL,
     model_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS machine_ideals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    machine_id INTEGER NOT NULL UNIQUE REFERENCES machines(id) ON DELETE CASCADE,
+    recorded_at TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    health REAL NOT NULL,
+    score REAL NOT NULL,
+    profile TEXT NOT NULL,
+    model_id TEXT NOT NULL
+);
+
 """
 
 
@@ -164,6 +175,33 @@ def add_reading(owner_id, machine_id, file_name, file_path, result, model_id):
              json.dumps(result["profile"]), json.dumps([round(float(v), 4) for v in result["segment_scores"]]),
              model_id),
         )
+
+def set_ideal(owner_id, machine_id, file_name, result, model_id):
+    if not owns(owner_id, machine_id):
+        raise PermissionError("Machine does not belong to this account")
+    with session() as conn:
+        conn.execute("DELETE FROM machine_ideals WHERE machine_id = ?", (machine_id,))
+        conn.execute(
+            "INSERT INTO machine_ideals (machine_id, recorded_at, file_name, health, score, "
+            "profile, model_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (machine_id, now(), file_name, result["health"], result["score"],
+             json.dumps(result["profile"]), model_id),
+        )
+
+
+def get_ideal(owner_id, machine_id):
+    with session() as conn:
+        row = conn.execute(
+            "SELECT i.* FROM machine_ideals i JOIN machines m ON m.id = i.machine_id "
+            "WHERE m.owner_id = ? AND i.machine_id = ?",
+            (owner_id, machine_id),
+        ).fetchone()
+    if row is None:
+        return None
+    ideal = dict(row)
+    ideal["profile"] = json.loads(ideal["profile"])
+    return ideal
+
 
 
 def readings(owner_id, machine_id, model_id=None):

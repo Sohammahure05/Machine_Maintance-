@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 
 import analytics
+import degradation
 from config import EVAL_PATH, SEG_SEC, SR
 
 PAGE = (8.27, 11.69)
@@ -77,7 +78,7 @@ def plot_trend(ax, prev, result):
 
 
 def plot_profile(ax, result, comparison):
-    ax.plot(analytics.CENTERS, comparison["baseline_profile"], color="#1565c0", label="machine baseline")
+    ax.plot(analytics.CENTERS, comparison["baseline_profile"], color="#1565c0", label="machine ideal")
     ax.plot(analytics.CENTERS, result["profile"], color="#c62828", label="this reading")
     ax.set_xscale("symlog", linthresh=500)
     ax.set_xlabel("Frequency (Hz)")
@@ -112,7 +113,7 @@ def summary_rows(result):
     ]
 
 
-def summary_page(result, meta):
+def summary_page(result, meta, ideal=None):
     fig = plt.figure(figsize=PAGE)
     color = COLORS[result["level"]]
     fig.text(0.08, 0.95, "Machine Condition Report", fontsize=20, weight="bold")
@@ -124,6 +125,10 @@ def summary_page(result, meta):
              bbox=dict(facecolor=color, edgecolor="none", boxstyle="round,pad=0.4"))
     fig.text(0.40, 0.855, result["level"], fontsize=16, weight="bold", color=color)
     fig.text(0.40, 0.832, f"Health index {result['health']:.0f} / 100", fontsize=11)
+    if ideal is not None and ideal["r2"] is not None:
+        fig.text(0.40, 0.812,
+                 f"Degradation vs machine ideal: {ideal['r2_pct']:.0f}% (R2 {ideal['r2']:.3f}), {ideal['condition']}",
+                 fontsize=10, color=color)
 
     ax = fig.add_axes([0.08, 0.46, 0.84, 0.32])
     ax.axis("off")
@@ -176,13 +181,13 @@ def history_page(result, history):
     fig = plt.figure(figsize=PAGE)
     prev, comparison, trend_info = history["prev"], history["comparison"], history["trend"]
     fig.text(0.08, 0.95, "History and comparison", fontsize=18, weight="bold")
-    fig.text(0.08, 0.925, f"{len(prev)} earlier reading(s) with the current model. "
+    fig.text(0.08, 0.925, f"{len(prev)} earlier normal reading(s) with the current model. "
                           f"Trend: {trend_info['direction']}.", fontsize=10, color="#444444")
     plot_trend(fig.add_axes([0.10, 0.68, 0.82, 0.19]), prev, result)
     if comparison is not None:
         plot_profile(fig.add_axes([0.10, 0.42, 0.82, 0.19]), result, comparison)
         changes = analytics.describe_changes(comparison)
-        text = [f"Compared with {comparison['readings_used']} earlier reading(s): health index "
+        text = [f"Compared with {comparison['readings_used']} earlier normal reading(s): health index "
                 f"{comparison['health_change']:+.0f} points against the baseline ({comparison['baseline_health']:.0f})."]
         text += ["Largest spectral changes: " + "; ".join(changes) + "."] if changes else []
         fig.text(0.08, 0.37, textwrap.fill(" ".join(text), 100), fontsize=9.5, va="top")
@@ -198,11 +203,52 @@ def history_page(result, history):
     return fig
 
 
-def build_pdf(result, signal, meta, reference, history=None):
+def degradation_page(result, ideal):
+    fig = plt.figure(figsize=PAGE)
+    fig.text(0.08, 0.95, "Degradation against this machine's ideal", fontsize=18, weight="bold")
+    fig.text(0.08, 0.925,
+             f"Ideal built from {ideal['clips']} healthy clip(s), saved {ideal['created']}.",
+             fontsize=10, color="#444444")
+    r2 = "n/a" if ideal["r2"] is None else f"{ideal['r2']:.3f}"
+    r2_pct = "n/a" if ideal["r2_pct"] is None else f"{ideal['r2_pct']:.0f}%"
+    shift = "n/a" if ideal["shift"] is None else f"{ideal['shift']:.0f}%"
+    rows = [
+        ["Ideal health", f"{ideal['health']:.0f} / 100"],
+        ["Health now", f"{result['health']:.0f} / 100"],
+        ["R2 against ideal", r2],
+        ["R2 degradation", r2_pct],
+        ["Spectral shift", shift],
+        ["Condition", ideal["condition"]],
+    ]
+    ax = fig.add_axes([0.08, 0.68, 0.84, 0.20])
+    ax.axis("off")
+    table = ax.table(cellText=rows, colLabels=["Indicator", "Value"],
+                     loc="upper left", cellLoc="left", colWidths=[0.40, 0.60])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.5)
+    for (row, _), cell in table.get_celld().items():
+        cell.set_edgecolor("#cccccc")
+        if row == 0:
+            cell.set_facecolor("#eeeeee")
+            cell.set_text_props(weight="bold")
+    degradation.plot_r2_trend(fig.add_axes([0.10, 0.36, 0.82, 0.24]), ideal["prev_pct"],
+                            ideal["r2_pct"] if ideal["r2_pct"] is not None else 0.0)
+    note = ("R2 compares the spectral shape of this reading with the machine's own ideal. "
+            "1.000 means identical shape. Lower values mean the sound has changed. "
+            "Degradation is (1 - R2) as a percentage. Condition: Healthy at R2 0.92 or above, "
+            "Watch from 0.88, Degraded below 0.88. These limits are provisional.")
+    fig.text(0.08, 0.28, textwrap.fill(note, 100), fontsize=9, va="top")
+    return fig
+
+
+def build_pdf(result, signal, meta, reference, history=None, ideal=None):
     buffer = io.BytesIO()
-    pages = [summary_page(result, meta), detail_page(result, signal, reference)]
+    pages = [summary_page(result, meta, ideal), detail_page(result, signal, reference)]
     if history is not None:
         pages.append(history_page(result, history))
+    if ideal is not None:
+        pages.append(degradation_page(result, ideal))
     with PdfPages(buffer) as pdf:
         for fig in pages:
             pdf.savefig(fig)
